@@ -1,0 +1,19 @@
+{
+  "name": "intranet-feedback-portal",
+  "version": "1.0.0",
+  "private": true,
+  "workspaces": [
+    "server",
+    "web"
+  ],
+  "scripts": {
+    "dev:server": "npm --workspace=server run dev",
+    "dev:web": "npm --workspace=web run dev",
+    "build:web": "npm --workspace=web run build",
+    "build:server": "npm --workspace=server run build",
+    "build": "npm run build:web && npm run build:server",
+    "start": "npm --workspace=server run start",
+    "typecheck": "npm --workspace=server run typecheck && npm --workspace=web run typecheck",
+    "test": "npm --workspace=server run test"
+  }
+}
