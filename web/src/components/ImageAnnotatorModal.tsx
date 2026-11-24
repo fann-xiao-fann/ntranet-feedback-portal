@@ -9,10 +9,12 @@ import {
 } from 'react';
 import {
   Check,
+  Edit3,
   Hand,
   Maximize2,
   Minimize2,
   Minus,
+  MousePointer2,
   MoveUpRight,
   Pencil,
   RotateCcw,
@@ -24,15 +26,23 @@ import {
   ZoomOut,
 } from 'lucide-react';
 
-type AnnotatorTool = 'pan' | 'rect' | 'arrow' | 'line' | 'pen' | 'text';
+type AnnotatorTool = 'select' | 'pan' | 'rect' | 'arrow' | 'line' | 'pen' | 'text';
 
 interface Point {
   x: number;
   y: number;
 }
 
+interface Bounds {
+  x: number;
+  y: number;
+  w: number;
+  h: number;
+}
+
 type Annotation =
   | {
+      id: string;
       type: 'rect';
       x: number;
       y: number;
@@ -42,6 +52,7 @@ type Annotation =
       strokeWidth: number;
     }
   | {
+      id: string;
       type: 'line';
       x1: number;
       y1: number;
@@ -51,6 +62,7 @@ type Annotation =
       strokeWidth: number;
     }
   | {
+      id: string;
       type: 'arrow';
       x1: number;
       y1: number;
@@ -60,12 +72,14 @@ type Annotation =
       strokeWidth: number;
     }
   | {
+      id: string;
       type: 'pen';
       points: Point[];
       color: string;
       strokeWidth: number;
     }
   | {
+      id: string;
       type: 'text';
       x: number;
       y: number;
@@ -75,9 +89,12 @@ type Annotation =
     };
 
 interface PendingTextInput {
+  editingId: string | null;
   imgX: number;
   imgY: number;
   value: string;
+  color: string;
+  fontSize: number;
 }
 
 interface ImageAnnotatorModalProps {
@@ -90,6 +107,8 @@ interface ImageAnnotatorModalProps {
 const MIN_SCALE = 0.25;
 const MAX_SCALE = 5;
 const MAX_UPLOAD_BYTES = 10 * 1024 * 1024;
+const FONT_STACK =
+  '-apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif';
 
 const COLORS = [
   { hex: '#ef4444', name: '红色' },
@@ -106,8 +125,143 @@ const SIZE_PRESETS = [
   { key: 'lg', label: '粗', multiplier: 1.5 },
 ] as const;
 
+function nextId(): string {
+  return `ann-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+}
+
 function clampScale(value: number): number {
   return Math.min(MAX_SCALE, Math.max(MIN_SCALE, Math.round(value * 100) / 100));
+}
+
+function distToSegment(p: Point, a: Point, b: Point): number {
+  const dx = b.x - a.x;
+  const dy = b.y - a.y;
+  const lenSq = dx * dx + dy * dy;
+  if (lenSq === 0) return Math.hypot(p.x - a.x, p.y - a.y);
+  let t = ((p.x - a.x) * dx + (p.y - a.y) * dy) / lenSq;
+  t = Math.max(0, Math.min(1, t));
+  return Math.hypot(p.x - (a.x + t * dx), p.y - (a.y + t * dy));
+}
+
+function getAnnotationBounds(ann: Annotation, ctx: CanvasRenderingContext2D | null): Bounds {
+  if (ann.type === 'rect') {
+    const pad = ann.strokeWidth / 2;
+    return { x: ann.x - pad, y: ann.y - pad, w: ann.w + pad * 2, h: ann.h + pad * 2 };
+  }
+  if (ann.type === 'line' || ann.type === 'arrow') {
+    const pad = Math.max(10, ann.strokeWidth * 2);
+    const minX = Math.min(ann.x1, ann.x2) - pad;
+    const minY = Math.min(ann.y1, ann.y2) - pad;
+    const maxX = Math.max(ann.x1, ann.x2) + pad;
+    const maxY = Math.max(ann.y1, ann.y2) + pad;
+    return { x: minX, y: minY, w: maxX - minX, h: maxY - minY };
+  }
+  if (ann.type === 'pen') {
+    const pad = Math.max(8, ann.strokeWidth);
+    let minX = Infinity;
+    let minY = Infinity;
+    let maxX = -Infinity;
+    let maxY = -Infinity;
+    for (const pt of ann.points) {
+      if (pt.x < minX) minX = pt.x;
+      if (pt.y < minY) minY = pt.y;
+      if (pt.x > maxX) maxX = pt.x;
+      if (pt.y > maxY) maxY = pt.y;
+    }
+    if (!Number.isFinite(minX)) return { x: 0, y: 0, w: 0, h: 0 };
+    return {
+      x: minX - pad,
+      y: minY - pad,
+      w: Math.max(16, maxX - minX + pad * 2),
+      h: Math.max(16, maxY - minY + pad * 2),
+    };
+  }
+  // text
+  const lines = ann.text.split('\n');
+  const lineHeight = ann.fontSize * 1.28;
+  let maxW = ann.fontSize * 2;
+  if (ctx) {
+    ctx.save();
+    ctx.font = `600 ${ann.fontSize}px ${FONT_STACK}`;
+    for (const line of lines) {
+      const m = ctx.measureText(line);
+      if (m.width > maxW) maxW = m.width;
+    }
+    ctx.restore();
+  } else {
+    for (const line of lines) {
+      maxW = Math.max(maxW, line.length * ann.fontSize * 0.9);
+    }
+  }
+  const pad = Math.max(8, ann.fontSize * 0.25);
+  return {
+    x: ann.x - pad,
+    y: ann.y - pad,
+    w: maxW + pad * 2,
+    h: lines.length * lineHeight + pad * 2,
+  };
+}
+
+function hitTestAnnotation(
+  ann: Annotation,
+  pt: Point,
+  ctx: CanvasRenderingContext2D | null,
+  tolerance: number
+): boolean {
+  if (ann.type === 'text') {
+    const b = getAnnotationBounds(ann, ctx);
+    return (
+      pt.x >= b.x - tolerance &&
+      pt.x <= b.x + b.w + tolerance &&
+      pt.y >= b.y - tolerance &&
+      pt.y <= b.y + b.h + tolerance
+    );
+  }
+  if (ann.type === 'rect') {
+    const edgeTol = Math.max(tolerance, ann.strokeWidth * 2);
+    const inOuter =
+      pt.x >= ann.x - edgeTol &&
+      pt.x <= ann.x + ann.w + edgeTol &&
+      pt.y >= ann.y - edgeTol &&
+      pt.y <= ann.y + ann.h + edgeTol;
+    if (!inOuter) return false;
+    const inInner =
+      pt.x >= ann.x + edgeTol &&
+      pt.x <= ann.x + ann.w - edgeTol &&
+      pt.y >= ann.y + edgeTol &&
+      pt.y <= ann.y + ann.h - edgeTol;
+    return !inInner;
+  }
+  if (ann.type === 'line' || ann.type === 'arrow') {
+    const segTol = Math.max(tolerance, ann.strokeWidth * 2.5);
+    return distToSegment(pt, { x: ann.x1, y: ann.y1 }, { x: ann.x2, y: ann.y2 }) <= segTol;
+  }
+  if (ann.type === 'pen') {
+    const segTol = Math.max(tolerance, ann.strokeWidth * 2.5);
+    if (ann.points.length === 1) {
+      return Math.hypot(pt.x - ann.points[0].x, pt.y - ann.points[0].y) <= segTol;
+    }
+    for (let i = 1; i < ann.points.length; i++) {
+      if (distToSegment(pt, ann.points[i - 1], ann.points[i]) <= segTol) {
+        return true;
+      }
+    }
+    return false;
+  }
+  return false;
+}
+
+function translateAnnotation(ann: Annotation, dx: number, dy: number): Annotation {
+  if (ann.type === 'rect') {
+    return { ...ann, x: ann.x + dx, y: ann.y + dy };
+  }
+  if (ann.type === 'line' || ann.type === 'arrow') {
+    return { ...ann, x1: ann.x1 + dx, y1: ann.y1 + dy, x2: ann.x2 + dx, y2: ann.y2 + dy };
+  }
+  if (ann.type === 'pen') {
+    return { ...ann, points: ann.points.map((p) => ({ x: p.x + dx, y: p.y + dy })) };
+  }
+  return { ...ann, x: ann.x + dx, y: ann.y + dy };
 }
 
 function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation) {
@@ -162,13 +316,13 @@ function drawAnnotation(ctx: CanvasRenderingContext2D, ann: Annotation) {
       ctx.stroke();
     }
   } else if (ann.type === 'text') {
-    ctx.font = `600 ${ann.fontSize}px -apple-system, BlinkMacSystemFont, "PingFang SC", "Microsoft YaHei", sans-serif`;
+    ctx.font = `600 ${ann.fontSize}px ${FONT_STACK}`;
     ctx.textBaseline = 'top';
     const lines = ann.text.split('\n');
     const lineHeight = ann.fontSize * 1.28;
-    // Draw subtle contrast halo so text stays readable on both dark and light screenshots
     ctx.lineWidth = Math.max(3, ann.fontSize * 0.14);
-    ctx.strokeStyle = ann.color === '#ffffff' ? 'rgba(15, 23, 42, 0.85)' : 'rgba(255, 255, 255, 0.92)';
+    ctx.strokeStyle =
+      ann.color === '#ffffff' ? 'rgba(15, 23, 42, 0.85)' : 'rgba(255, 255, 255, 0.92)';
     lines.forEach((line, idx) => {
       const y = ann.y + idx * lineHeight;
       ctx.strokeText(line, ann.x, y);
@@ -196,11 +350,17 @@ export function ImageAnnotatorModal({
   const [tool, setTool] = useState<AnnotatorTool>('rect');
   const [color, setColor] = useState<string>(COLORS[0].hex);
   const [sizePreset, setSizePreset] = useState<'sm' | 'md' | 'lg'>('md');
+
   const [annotations, setAnnotations] = useState<Annotation[]>([]);
+  const [history, setHistory] = useState<Annotation[][]>([]);
+  const [selectedId, setSelectedId] = useState<string | null>(null);
   const [draft, setDraft] = useState<Annotation | null>(null);
   const [pendingText, setPendingText] = useState<PendingTextInput | null>(null);
   const [spacePressed, setSpacePressed] = useState(false);
   const [saving, setSaving] = useState(false);
+
+  const annotationsRef = useRef<Annotation[]>(annotations);
+  annotationsRef.current = annotations;
 
   const interactionRef = useRef<
     | {
@@ -214,13 +374,26 @@ export function ImageAnnotatorModal({
     | {
         mode: 'draw';
         pointerId: number;
-        tool: Exclude<AnnotatorTool, 'pan' | 'text'>;
+        tool: Exclude<AnnotatorTool, 'select' | 'pan' | 'text'>;
         startImg: Point;
+      }
+    | {
+        mode: 'move';
+        pointerId: number;
+        targetId: string;
+        startImg: Point;
+        originalAnn: Annotation;
+        beforeList: Annotation[];
+        moved: boolean;
       }
     | null
   >(null);
 
   const isPanMode = tool === 'pan' || spacePressed;
+
+  const pushHistory = useCallback((snapshot: Annotation[]) => {
+    setHistory((prev) => [...prev.slice(-49), snapshot]);
+  }, []);
 
   const computeFitScale = useCallback((natW: number, natH: number): number => {
     const vp = viewportRef.current;
@@ -231,17 +404,27 @@ export function ImageAnnotatorModal({
     return clampScale(Math.min(1, availW / natW, availH / natH));
   }, []);
 
-  const getStrokeWidth = useCallback((): number => {
-    const base = naturalSize ? Math.max(3, Math.round(Math.max(naturalSize.w, naturalSize.h) / 360)) : 4;
-    const mult = SIZE_PRESETS.find((s) => s.key === sizePreset)?.multiplier ?? 1;
-    return Math.max(2, Math.round(base * mult));
-  }, [naturalSize, sizePreset]);
+  const getStrokeWidth = useCallback(
+    (preset: 'sm' | 'md' | 'lg' = sizePreset): number => {
+      const base = naturalSize
+        ? Math.max(3, Math.round(Math.max(naturalSize.w, naturalSize.h) / 360))
+        : 4;
+      const mult = SIZE_PRESETS.find((s) => s.key === preset)?.multiplier ?? 1;
+      return Math.max(2, Math.round(base * mult));
+    },
+    [naturalSize, sizePreset]
+  );
 
-  const getFontSize = useCallback((): number => {
-    const base = naturalSize ? Math.max(20, Math.round(Math.max(naturalSize.w, naturalSize.h) / 48)) : 24;
-    const mult = SIZE_PRESETS.find((s) => s.key === sizePreset)?.multiplier ?? 1;
-    return Math.max(16, Math.round(base * mult));
-  }, [naturalSize, sizePreset]);
+  const getFontSize = useCallback(
+    (preset: 'sm' | 'md' | 'lg' = sizePreset): number => {
+      const base = naturalSize
+        ? Math.max(20, Math.round(Math.max(naturalSize.w, naturalSize.h) / 48))
+        : 24;
+      const mult = SIZE_PRESETS.find((s) => s.key === preset)?.multiplier ?? 1;
+      return Math.max(16, Math.round(base * mult));
+    },
+    [naturalSize, sizePreset]
+  );
 
   const resetToFit = useCallback(() => {
     setOffset({ x: 0, y: 0 });
@@ -253,27 +436,78 @@ export function ImageAnnotatorModal({
   }, [computeFitScale, naturalSize]);
 
   const handleUndo = useCallback(() => {
-    setAnnotations((prev) => (prev.length > 0 ? prev.slice(0, -1) : prev));
+    setHistory((prev) => {
+      if (prev.length === 0) return prev;
+      const previous = prev[prev.length - 1];
+      setAnnotations(previous);
+      setSelectedId(null);
+      return prev.slice(0, -1);
+    });
   }, []);
+
+  const handleDeleteSelected = useCallback(() => {
+    if (!selectedId) return;
+    const current = annotationsRef.current;
+    if (!current.some((a) => a.id === selectedId)) return;
+    pushHistory(current);
+    setAnnotations(current.filter((a) => a.id !== selectedId));
+    setSelectedId(null);
+  }, [selectedId, pushHistory]);
 
   const commitPendingText = useCallback(() => {
     if (!pendingText) return;
     const text = pendingText.value.trim();
-    if (text) {
-      setAnnotations((prev) => [
-        ...prev,
+    const current = annotationsRef.current;
+
+    if (pendingText.editingId) {
+      pushHistory(current);
+      if (!text) {
+        // Clearing text deletes that annotation
+        setAnnotations(current.filter((a) => a.id !== pendingText.editingId));
+        setSelectedId(null);
+      } else {
+        setAnnotations(
+          current.map((a) =>
+            a.id === pendingText.editingId && a.type === 'text'
+              ? { ...a, text, color: pendingText.color, fontSize: pendingText.fontSize }
+              : a
+          )
+        );
+        setSelectedId(pendingText.editingId);
+      }
+    } else if (text) {
+      const createdId = nextId();
+      pushHistory(current);
+      setAnnotations([
+        ...current,
         {
+          id: createdId,
           type: 'text',
           x: pendingText.imgX,
           y: pendingText.imgY,
           text,
-          color,
-          fontSize: getFontSize(),
+          color: pendingText.color,
+          fontSize: pendingText.fontSize,
         },
       ]);
+      // Auto-select newly created text so user can drag or delete it immediately!
+      setSelectedId(createdId);
     }
+
     setPendingText(null);
-  }, [pendingText, color, getFontSize]);
+  }, [pendingText, pushHistory]);
+
+  const openEditForText = useCallback((ann: Extract<Annotation, { type: 'text' }>) => {
+    setSelectedId(ann.id);
+    setPendingText({
+      editingId: ann.id,
+      imgX: ann.x,
+      imgY: ann.y,
+      value: ann.text,
+      color: ann.color,
+      fontSize: ann.fontSize,
+    });
+  }, []);
 
   // Load image when modal opens
   useEffect(() => {
@@ -281,6 +515,8 @@ export function ImageAnnotatorModal({
       imgElementRef.current = null;
       setNaturalSize(null);
       setAnnotations([]);
+      setHistory([]);
+      setSelectedId(null);
       setDraft(null);
       setPendingText(null);
       return;
@@ -295,6 +531,8 @@ export function ImageAnnotatorModal({
       const h = img.naturalHeight;
       setNaturalSize({ w, h });
       setAnnotations([]);
+      setHistory([]);
+      setSelectedId(null);
       setDraft(null);
       setPendingText(null);
       setTool('rect');
@@ -308,7 +546,7 @@ export function ImageAnnotatorModal({
     };
   }, [imageUrl, computeFitScale]);
 
-  // Redraw canvas whenever image, annotations, or draft changes
+  // Redraw canvas whenever image, annotations, draft, or selection changes
   useEffect(() => {
     const canvas = canvasRef.current;
     const img = imgElementRef.current;
@@ -323,22 +561,44 @@ export function ImageAnnotatorModal({
 
     ctx.clearRect(0, 0, canvas.width, canvas.height);
     ctx.drawImage(img, 0, 0, naturalSize.w, naturalSize.h);
+
     for (const ann of annotations) {
+      // Hide the text currently being edited inline to avoid double rendering
+      if (pendingText?.editingId && ann.id === pendingText.editingId) {
+        continue;
+      }
       drawAnnotation(ctx, ann);
     }
+
     if (draft) {
       drawAnnotation(ctx, draft);
     }
-  }, [naturalSize, annotations, draft]);
+
+    // Draw crisp selection dashed box around selected annotation
+    if (selectedId && !pendingText?.editingId) {
+      const selected = annotations.find((a) => a.id === selectedId);
+      if (selected) {
+        const b = getAnnotationBounds(selected, ctx);
+        ctx.save();
+        ctx.strokeStyle = '#3b82f6';
+        ctx.lineWidth = Math.max(2, 2 / scale);
+        ctx.setLineDash([Math.max(6, 6 / scale), Math.max(4, 4 / scale)]);
+        ctx.strokeRect(b.x, b.y, b.w, b.h);
+        ctx.restore();
+      }
+    }
+  }, [naturalSize, annotations, draft, selectedId, pendingText, scale]);
 
   // Focus text input when opened
   useEffect(() => {
     if (pendingText && textInputRef.current) {
       textInputRef.current.focus();
+      const len = textInputRef.current.value.length;
+      textInputRef.current.setSelectionRange(len, len);
     }
   }, [pendingText]);
 
-  // Lock body scroll & keyboard shortcuts
+  // Keyboard shortcuts
   useEffect(() => {
     if (!imageUrl) return;
     const prevOverflow = document.body.style.overflow;
@@ -351,6 +611,8 @@ export function ImageAnnotatorModal({
       if (e.key === 'Escape') {
         if (pendingText) {
           setPendingText(null);
+        } else if (selectedId) {
+          setSelectedId(null);
         } else {
           onClose();
         }
@@ -362,6 +624,9 @@ export function ImageAnnotatorModal({
       if ((e.metaKey || e.ctrlKey) && e.key.toLowerCase() === 'z') {
         e.preventDefault();
         handleUndo();
+      } else if ((e.key === 'Delete' || e.key === 'Backspace') && selectedId) {
+        e.preventDefault();
+        handleDeleteSelected();
       } else if (e.code === 'Space') {
         e.preventDefault();
         setSpacePressed(true);
@@ -390,7 +655,7 @@ export function ImageAnnotatorModal({
       window.removeEventListener('keydown', onKeyDown);
       window.removeEventListener('keyup', onKeyUp);
     };
-  }, [imageUrl, onClose, handleUndo, resetToFit, pendingText]);
+  }, [imageUrl, onClose, handleUndo, handleDeleteSelected, resetToFit, pendingText, selectedId]);
 
   if (!imageUrl) return null;
 
@@ -405,6 +670,53 @@ export function ImageAnnotatorModal({
     };
   }
 
+  function findHitAnnotation(pt: Point, onlyText = false): Annotation | null {
+    const ctx = canvasRef.current?.getContext('2d') ?? null;
+    const tolerance = Math.max(10, 12 / scale);
+    // Search top-most first
+    for (let i = annotations.length - 1; i >= 0; i--) {
+      const ann = annotations[i];
+      if (onlyText && ann.type !== 'text') continue;
+      if (hitTestAnnotation(ann, pt, ctx, tolerance)) {
+        return ann;
+      }
+    }
+    return null;
+  }
+
+  function handleColorSelect(nextColor: string) {
+    setColor(nextColor);
+    if (pendingText) {
+      setPendingText({ ...pendingText, color: nextColor });
+      return;
+    }
+    if (selectedId) {
+      const current = annotationsRef.current;
+      pushHistory(current);
+      setAnnotations(current.map((a) => (a.id === selectedId ? { ...a, color: nextColor } : a)));
+    }
+  }
+
+  function handleSizeSelect(nextPreset: 'sm' | 'md' | 'lg') {
+    setSizePreset(nextPreset);
+    if (pendingText) {
+      setPendingText({ ...pendingText, fontSize: getFontSize(nextPreset) });
+      return;
+    }
+    if (selectedId) {
+      const current = annotationsRef.current;
+      const sw = getStrokeWidth(nextPreset);
+      const fs = getFontSize(nextPreset);
+      pushHistory(current);
+      setAnnotations(
+        current.map((a) => {
+          if (a.id !== selectedId) return a;
+          return a.type === 'text' ? { ...a, fontSize: fs } : { ...a, strokeWidth: sw };
+        })
+      );
+    }
+  }
+
   function handleWheel(e: ReactWheelEvent<HTMLDivElement>) {
     e.preventDefault();
     const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
@@ -412,7 +724,6 @@ export function ImageAnnotatorModal({
   }
 
   function handleViewportPointerDown(e: ReactPointerEvent<HTMLDivElement>) {
-    // Middle button or Pan mode pans from anywhere in viewport
     if (e.button === 1 || (e.button === 0 && isPanMode)) {
       if (pendingText) commitPendingText();
       e.currentTarget.setPointerCapture(e.pointerId);
@@ -424,6 +735,9 @@ export function ImageAnnotatorModal({
         originX: offset.x,
         originY: offset.y,
       };
+    } else if (e.target === e.currentTarget && e.button === 0) {
+      if (pendingText) commitPendingText();
+      setSelectedId(null);
     }
   }
 
@@ -434,24 +748,66 @@ export function ImageAnnotatorModal({
     const pt = clientToImageCoords(e.clientX, e.clientY);
     if (!pt || !naturalSize) return;
 
-    if (tool === 'text') {
-      if (pendingText) {
-        commitPendingText();
-      }
-      setPendingText({
-        imgX: Math.max(0, Math.min(naturalSize.w - 20, pt.x)),
-        imgY: Math.max(0, Math.min(naturalSize.h - 20, pt.y)),
-        value: '',
-      });
-      return;
-    }
-
     if (pendingText) {
       commitPendingText();
     }
 
+    // In SELECT mode: hit-test ANY annotation to select & drag-move
+    if (tool === 'select') {
+      const hit = findHitAnnotation(pt, false);
+      if (hit) {
+        setSelectedId(hit.id);
+        e.currentTarget.setPointerCapture(e.pointerId);
+        interactionRef.current = {
+          mode: 'move',
+          pointerId: e.pointerId,
+          targetId: hit.id,
+          startImg: pt,
+          originalAnn: hit,
+          beforeList: annotationsRef.current,
+          moved: false,
+        };
+      } else {
+        setSelectedId(null);
+      }
+      return;
+    }
+
+    // In TEXT mode: clicking an existing text selects & drags it; clicking empty area creates new text
+    if (tool === 'text') {
+      const hitText = findHitAnnotation(pt, true);
+      if (hitText) {
+        setSelectedId(hitText.id);
+        e.currentTarget.setPointerCapture(e.pointerId);
+        interactionRef.current = {
+          mode: 'move',
+          pointerId: e.pointerId,
+          targetId: hitText.id,
+          startImg: pt,
+          originalAnn: hitText,
+          beforeList: annotationsRef.current,
+          moved: false,
+        };
+        return;
+      }
+
+      setSelectedId(null);
+      setPendingText({
+        editingId: null,
+        imgX: Math.max(0, Math.min(naturalSize.w - 20, pt.x)),
+        imgY: Math.max(0, Math.min(naturalSize.h - 20, pt.y)),
+        value: '',
+        color,
+        fontSize: getFontSize(),
+      });
+      return;
+    }
+
+    // Drawing modes (rect / line / arrow / pen)
+    setSelectedId(null);
     e.currentTarget.setPointerCapture(e.pointerId);
     const sw = getStrokeWidth();
+    const id = nextId();
     interactionRef.current = {
       mode: 'draw',
       pointerId: e.pointerId,
@@ -460,13 +816,32 @@ export function ImageAnnotatorModal({
     };
 
     if (tool === 'rect') {
-      setDraft({ type: 'rect', x: pt.x, y: pt.y, w: 0, h: 0, color, strokeWidth: sw });
+      setDraft({ id, type: 'rect', x: pt.x, y: pt.y, w: 0, h: 0, color, strokeWidth: sw });
     } else if (tool === 'line') {
-      setDraft({ type: 'line', x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y, color, strokeWidth: sw });
+      setDraft({ id, type: 'line', x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y, color, strokeWidth: sw });
     } else if (tool === 'arrow') {
-      setDraft({ type: 'arrow', x1: pt.x, y1: pt.y, x2: pt.x, y2: pt.y, color, strokeWidth: sw });
+      setDraft({
+        id,
+        type: 'arrow',
+        x1: pt.x,
+        y1: pt.y,
+        x2: pt.x,
+        y2: pt.y,
+        color,
+        strokeWidth: sw,
+      });
     } else if (tool === 'pen') {
-      setDraft({ type: 'pen', points: [pt], color, strokeWidth: sw });
+      setDraft({ id, type: 'pen', points: [pt], color, strokeWidth: sw });
+    }
+  }
+
+  function handleCanvasDoubleClick(e: React.MouseEvent<HTMLCanvasElement>) {
+    if (isPanMode) return;
+    const pt = clientToImageCoords(e.clientX, e.clientY);
+    if (!pt) return;
+    const hitText = findHitAnnotation(pt, true);
+    if (hitText && hitText.type === 'text') {
+      openEditForText(hitText);
     }
   }
 
@@ -484,34 +859,39 @@ export function ImageAnnotatorModal({
 
     const pt = clientToImageCoords(e.clientX, e.clientY);
     if (!pt) return;
-    const sw = getStrokeWidth();
 
+    if (inter.mode === 'move') {
+      const dx = pt.x - inter.startImg.x;
+      const dy = pt.y - inter.startImg.y;
+      if (Math.abs(dx) > 2 || Math.abs(dy) > 2) {
+        inter.moved = true;
+      }
+      const movedAnn = translateAnnotation(inter.originalAnn, dx, dy);
+      setAnnotations((prev) => prev.map((a) => (a.id === inter.targetId ? movedAnn : a)));
+      return;
+    }
+
+    const sw = getStrokeWidth();
     if (inter.tool === 'rect') {
       const x = Math.min(inter.startImg.x, pt.x);
       const y = Math.min(inter.startImg.y, pt.y);
       const w = Math.abs(pt.x - inter.startImg.x);
       const h = Math.abs(pt.y - inter.startImg.y);
-      setDraft({ type: 'rect', x, y, w, h, color, strokeWidth: sw });
+      setDraft((prev) =>
+        prev && prev.type === 'rect' ? { ...prev, x, y, w, h, color, strokeWidth: sw } : prev
+      );
     } else if (inter.tool === 'line') {
-      setDraft({
-        type: 'line',
-        x1: inter.startImg.x,
-        y1: inter.startImg.y,
-        x2: pt.x,
-        y2: pt.y,
-        color,
-        strokeWidth: sw,
-      });
+      setDraft((prev) =>
+        prev && prev.type === 'line'
+          ? { ...prev, x1: inter.startImg.x, y1: inter.startImg.y, x2: pt.x, y2: pt.y, color, strokeWidth: sw }
+          : prev
+      );
     } else if (inter.tool === 'arrow') {
-      setDraft({
-        type: 'arrow',
-        x1: inter.startImg.x,
-        y1: inter.startImg.y,
-        x2: pt.x,
-        y2: pt.y,
-        color,
-        strokeWidth: sw,
-      });
+      setDraft((prev) =>
+        prev && prev.type === 'arrow'
+          ? { ...prev, x1: inter.startImg.x, y1: inter.startImg.y, x2: pt.x, y2: pt.y, color, strokeWidth: sw }
+          : prev
+      );
     } else if (inter.tool === 'pen') {
       setDraft((prev) =>
         prev && prev.type === 'pen' ? { ...prev, points: [...prev.points, pt] } : prev
@@ -524,6 +904,13 @@ export function ImageAnnotatorModal({
     if (!inter || inter.pointerId !== e.pointerId) return;
     interactionRef.current = null;
 
+    if (inter.mode === 'move') {
+      if (inter.moved) {
+        pushHistory(inter.beforeList);
+      }
+      return;
+    }
+
     if (inter.mode === 'draw' && draft) {
       const isMeaningful =
         draft.type === 'pen'
@@ -534,6 +921,7 @@ export function ImageAnnotatorModal({
               ? Math.hypot(draft.x2 - draft.x1, draft.y2 - draft.y1) > 3
               : true;
       if (isMeaningful) {
+        pushHistory(annotationsRef.current);
         setAnnotations((prev) => [...prev, draft]);
       }
       setDraft(null);
@@ -541,7 +929,6 @@ export function ImageAnnotatorModal({
   }
 
   function handleTextKeyDown(e: ReactKeyboardEvent<HTMLTextAreaElement>) {
-    // Allow IME composition and Shift+Enter for multiline text
     if (e.nativeEvent.isComposing) return;
     if (e.key === 'Enter' && !e.shiftKey) {
       e.preventDefault();
@@ -559,17 +946,37 @@ export function ImageAnnotatorModal({
       return;
     }
 
-    // Commit any active text box before saving
     const finalAnnotations = [...annotations];
-    if (pendingText && pendingText.value.trim()) {
-      finalAnnotations.push({
-        type: 'text',
-        x: pendingText.imgX,
-        y: pendingText.imgY,
-        text: pendingText.value.trim(),
-        color,
-        fontSize: getFontSize(),
-      });
+    if (pendingText) {
+      const trimmed = pendingText.value.trim();
+      if (pendingText.editingId) {
+        const idx = finalAnnotations.findIndex((a) => a.id === pendingText.editingId);
+        if (idx >= 0) {
+          if (!trimmed) {
+            finalAnnotations.splice(idx, 1);
+          } else {
+            finalAnnotations[idx] = {
+              id: pendingText.editingId,
+              type: 'text',
+              x: pendingText.imgX,
+              y: pendingText.imgY,
+              text: trimmed,
+              color: pendingText.color,
+              fontSize: pendingText.fontSize,
+            };
+          }
+        }
+      } else if (trimmed) {
+        finalAnnotations.push({
+          id: nextId(),
+          type: 'text',
+          x: pendingText.imgX,
+          y: pendingText.imgY,
+          text: trimmed,
+          color: pendingText.color,
+          fontSize: pendingText.fontSize,
+        });
+      }
     }
 
     if (finalAnnotations.length === 0) {
@@ -618,8 +1025,27 @@ export function ImageAnnotatorModal({
   }
 
   const percent = Math.round(scale * 100);
+  const selectedAnn =
+    selectedId && !pendingText?.editingId
+      ? annotations.find((a) => a.id === selectedId) ?? null
+      : null;
 
-  // Compute screen-relative position for inline text box overlay
+  // Floating action bar position for selected annotation
+  const selectedOverlayPos = (() => {
+    if (!selectedAnn || !naturalSize || !canvasRef.current || !viewportRef.current) return null;
+    const ctx = canvasRef.current.getContext('2d');
+    const b = getAnnotationBounds(selectedAnn, ctx);
+    const canvasRect = canvasRef.current.getBoundingClientRect();
+    const vpRect = viewportRef.current.getBoundingClientRect();
+    const rightX = canvasRect.left - vpRect.left + ((b.x + b.w) / naturalSize.w) * canvasRect.width;
+    const topY = canvasRect.top - vpRect.top + (b.y / naturalSize.h) * canvasRect.height;
+    return {
+      left: Math.max(8, Math.min(vpRect.width - 140, rightX - 4)),
+      top: Math.max(8, topY - 34),
+    };
+  })();
+
+  // Inline text input overlay position
   const textBoxStyle = (() => {
     if (!pendingText || !naturalSize || !canvasRef.current || !viewportRef.current) return null;
     const canvasRect = canvasRef.current.getBoundingClientRect();
@@ -627,11 +1053,12 @@ export function ImageAnnotatorModal({
     return {
       left: canvasRect.left - vpRect.left + (pendingText.imgX / naturalSize.w) * canvasRect.width,
       top: canvasRect.top - vpRect.top + (pendingText.imgY / naturalSize.h) * canvasRect.height,
-      fontSize: Math.max(14, Math.round(getFontSize() * scale)),
+      fontSize: Math.max(14, Math.round(pendingText.fontSize * scale)),
     };
   })();
 
   const toolButtons: Array<{ id: AnnotatorTool; label: string; icon: typeof Square }> = [
+    { id: 'select', label: '选择', icon: MousePointer2 },
     { id: 'pan', label: '拖拽', icon: Hand },
     { id: 'rect', label: '画框', icon: Square },
     { id: 'arrow', label: '箭头', icon: MoveUpRight },
@@ -649,7 +1076,7 @@ export function ImageAnnotatorModal({
     >
       {/* Top Toolbar */}
       <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-800 bg-slate-950 px-3 py-2.5 text-xs text-slate-200 sm:px-4">
-        {/* Drawing Tools */}
+        {/* Tools */}
         <div className="flex flex-wrap items-center gap-1">
           {toolButtons.map(({ id, label, icon: Icon }) => {
             const active = tool === id && !spacePressed;
@@ -682,7 +1109,7 @@ export function ImageAnnotatorModal({
                 key={c.hex}
                 type="button"
                 title={c.name}
-                onClick={() => setColor(c.hex)}
+                onClick={() => handleColorSelect(c.hex)}
                 style={{ backgroundColor: c.hex }}
                 className={`h-5 w-5 rounded-full border-2 transition-transform ${
                   color === c.hex
@@ -701,7 +1128,7 @@ export function ImageAnnotatorModal({
               <button
                 key={s.key}
                 type="button"
-                onClick={() => setSizePreset(s.key)}
+                onClick={() => handleSizeSelect(s.key)}
                 className={`rounded-md px-2 py-1 text-[11px] font-medium ${
                   sizePreset === s.key
                     ? 'bg-slate-200 text-slate-900'
@@ -714,7 +1141,7 @@ export function ImageAnnotatorModal({
           </div>
         </div>
 
-        {/* Zoom + Undo + Save Controls */}
+        {/* Zoom + Undo + Save */}
         <div className="flex flex-wrap items-center gap-1.5">
           <button
             type="button"
@@ -766,7 +1193,7 @@ export function ImageAnnotatorModal({
           <button
             type="button"
             onClick={handleUndo}
-            disabled={annotations.length === 0}
+            disabled={history.length === 0}
             title="撤销 (⌘+Z / Ctrl+Z)"
             className="inline-flex items-center gap-1 rounded-lg bg-slate-800 px-2.5 py-1.5 text-white hover:bg-slate-700 disabled:opacity-40"
           >
@@ -777,7 +1204,9 @@ export function ImageAnnotatorModal({
           <button
             type="button"
             onClick={() => {
+              if (annotations.length > 0) pushHistory(annotations);
               setAnnotations([]);
+              setSelectedId(null);
               setPendingText(null);
             }}
             disabled={annotations.length === 0 && !pendingText}
@@ -819,12 +1248,19 @@ export function ImageAnnotatorModal({
         onPointerUp={handlePointerUp}
         onPointerCancel={handlePointerUp}
         className={`relative flex flex-1 items-center justify-center overflow-hidden ${
-          isPanMode ? 'cursor-grab active:cursor-grabbing' : tool === 'text' ? 'cursor-text' : 'cursor-crosshair'
+          isPanMode
+            ? 'cursor-grab active:cursor-grabbing'
+            : tool === 'select'
+              ? 'cursor-default'
+              : tool === 'text'
+                ? 'cursor-text'
+                : 'cursor-crosshair'
         }`}
       >
         <canvas
           ref={canvasRef}
           onPointerDown={handleCanvasPointerDown}
+          onDoubleClick={handleCanvasDoubleClick}
           onPointerMove={handlePointerMove}
           onPointerUp={handlePointerUp}
           onPointerCancel={handlePointerUp}
@@ -834,6 +1270,34 @@ export function ImageAnnotatorModal({
           }}
           className="max-w-none shadow-2xl"
         />
+
+        {/* Floating Edit / Delete Bar for Selected Annotation */}
+        {selectedAnn && selectedOverlayPos && (
+          <div
+            style={{ left: selectedOverlayPos.left, top: selectedOverlayPos.top }}
+            onPointerDown={(e) => e.stopPropagation()}
+            className="absolute z-20 flex items-center gap-1 rounded-lg border border-slate-700 bg-slate-900/95 p-1 text-[11px] text-white shadow-lg"
+          >
+            {selectedAnn.type === 'text' && (
+              <button
+                type="button"
+                onClick={() => openEditForText(selectedAnn)}
+                className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium text-blue-300 hover:bg-slate-800"
+              >
+                <Edit3 className="h-3 w-3" />
+                编辑
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={handleDeleteSelected}
+              className="inline-flex items-center gap-1 rounded px-2 py-0.5 font-medium text-red-300 hover:bg-red-600 hover:text-white"
+            >
+              <Trash2 className="h-3 w-3" />
+              删除
+            </button>
+          </div>
+        )}
 
         {/* Inline Text Input Box on Canvas */}
         {pendingText && textBoxStyle && (
@@ -849,8 +1313,8 @@ export function ImageAnnotatorModal({
               onChange={(e) => setPendingText({ ...pendingText, value: e.target.value })}
               onKeyDown={handleTextKeyDown}
               placeholder="输入标注文字，Enter 确认..."
-              style={{ color, fontSize: `${textBoxStyle.fontSize}px` }}
-              className="min-w-[180px] resize rounded-lg border-2 border-blue-500 bg-white/90 px-2 py-1 font-semibold leading-snug shadow-lg focus:outline-none"
+              style={{ color: pendingText.color, fontSize: `${textBoxStyle.fontSize}px` }}
+              className="min-w-[180px] resize rounded-lg border-2 border-blue-500 bg-white/95 px-2 py-1 font-semibold leading-snug shadow-lg focus:outline-none"
             />
             <div className="flex items-center gap-1">
               <button
@@ -874,7 +1338,7 @@ export function ImageAnnotatorModal({
 
       {/* Bottom Tip Bar */}
       <div className="border-t border-slate-800/80 bg-slate-950/90 px-4 py-1.5 text-center text-[11px] text-slate-400">
-        滚轮随时缩放 · 按住空格键或选择「拖拽」平移图片 · 选中「打字」点击图片任意位置输入文字（Shift+Enter 换行）· ⌘+Z / Ctrl+Z 撤销
+        点击已有文字可直接拖动改位置、双击重新编辑、按 Delete 或点「删除」移除 · 切到「选择」可移动或删除任意框/线 · 滚轮缩放 · 空格拖拽画布 · ⌘+Z 撤销
       </div>
     </div>
   );
